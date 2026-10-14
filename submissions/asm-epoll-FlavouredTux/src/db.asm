@@ -17,6 +17,7 @@ extern sqlite3_column_bytes
 extern sqlite3_changes
 extern sqlite3_errmsg
 extern sqlite3_close
+extern sqlite3_wal_checkpoint_v2
 extern u64_to_str
 extern json_escape_string
 
@@ -25,8 +26,10 @@ section .rodata
 pragmas_sql:
     db "PRAGMA journal_mode = WAL; "
     db "PRAGMA synchronous = NORMAL; "
-    db "PRAGMA mmap_size = 268435456; "
-    db "PRAGMA cache_size = -64000; "
+    db "PRAGMA mmap_size = 134217728; "
+    db "PRAGMA cache_size = -32000; "
+    db "PRAGMA wal_autocheckpoint = 1000; "
+    db "PRAGMA journal_size_limit = 67108864; "
     db "PRAGMA temp_store = MEMORY; "
     db "PRAGMA busy_timeout = 5000;", 0
 
@@ -108,6 +111,7 @@ stmt_get_post:      resq 1
 stmt_check_post:    resq 1
 stmt_insert_post:   resq 1
 stmt_insert_like:   resq 1
+write_counter:      resd 1
 
 section .text
 
@@ -117,6 +121,30 @@ global db_get_feed
 global db_get_post
 global db_create_post
 global db_like_post
+
+; Checkpoint WAL periodically to keep WAL file size bounded
+maybe_checkpoint:
+    inc dword [write_counter]
+    test dword [write_counter], 0x1ff   ; every 512 writes
+    jnz .done
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push r8
+    mov rdi, [db_handle]
+    xor esi, esi            ; NULL = all databases / main
+    mov edx, 2              ; SQLITE_CHECKPOINT_RESTART (2) or SQLITE_CHECKPOINT_PASSIVE (0)
+    xor ecx, ecx
+    xor r8d, r8d
+    call sqlite3_wal_checkpoint_v2
+    pop r8
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+.done:
+    ret
 
 ; =============================================================================
 ; init_db(const char *path [rdi]) -> rax (0 = success, 1 = failure)
@@ -232,6 +260,10 @@ db_check_health:
     call sqlite3_reset
     mov rdi, [stmt_health]
     call sqlite3_step
+    push rax
+    mov rdi, [stmt_health]
+    call sqlite3_reset
+    pop rax
     cmp eax, SQLITE_ROW
     jne .fail
     mov eax, 1
@@ -449,6 +481,10 @@ db_get_feed:
     mov [r13], rax
     mov byte [r12], 0       ; null terminate
 
+    ; Reset stmt_feed to release SQLite read transaction
+    mov rdi, [stmt_feed]
+    call sqlite3_reset
+
     xor eax, eax
     leave
     pop r14
@@ -513,6 +549,10 @@ db_get_post:
     mov [r13], rax
     mov byte [r12], 0
 
+    ; Reset stmt_get_post to release SQLite read transaction
+    mov rdi, [stmt_get_post]
+    call sqlite3_reset
+
     xor eax, eax            ; found!
     leave
     pop r14
@@ -522,6 +562,8 @@ db_get_post:
     ret
 
 .not_found:
+    mov rdi, [stmt_get_post]
+    call sqlite3_reset
     mov eax, 1
     leave
     pop r14
@@ -680,6 +722,11 @@ db_create_post:
     mov [r13], rax
     mov byte [r12], 0
 
+    ; Reset stmt and checkpoint
+    mov rdi, [stmt_insert_post]
+    call sqlite3_reset
+    call maybe_checkpoint
+
     xor eax, eax            ; success
     leave
     pop r15
@@ -690,6 +737,8 @@ db_create_post:
     ret
 
 .err:
+    mov rdi, [stmt_insert_post]
+    call sqlite3_reset
     mov eax, 1
     leave
     pop r15
@@ -736,6 +785,10 @@ db_like_post:
     call sqlite3_step
     cmp eax, SQLITE_ROW
     jne .post_not_found
+
+    ; Reset stmt_check_post immediately so read lock is released
+    mov rdi, [stmt_check_post]
+    call sqlite3_reset
 
     ; 2. Post exists! Insert like
     mov rdi, [stmt_insert_like]
@@ -784,6 +837,11 @@ db_like_post:
     mov [r13], rax
     mov byte [r12], 0
 
+    ; Reset insert_like
+    mov rdi, [stmt_insert_like]
+    call sqlite3_reset
+    call maybe_checkpoint
+
     mov eax, 201
     leave
     pop r15
@@ -818,6 +876,11 @@ db_like_post:
     mov [r13], rax
     mov byte [r12], 0
 
+    ; Reset insert_like
+    mov rdi, [stmt_insert_like]
+    call sqlite3_reset
+    call maybe_checkpoint
+
     mov eax, 200
     leave
     pop r15
@@ -828,6 +891,8 @@ db_like_post:
     ret
 
 .post_not_found:
+    mov rdi, [stmt_check_post]
+    call sqlite3_reset
     mov eax, 404
     leave
     pop r15
