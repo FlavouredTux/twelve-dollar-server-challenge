@@ -29,6 +29,7 @@ extern memcpy
 
 ; External module functions & data
 extern init_db
+extern init_jwt
 extern handle_http_request
 extern server_start_time
 extern jwt_secret_buf
@@ -44,14 +45,16 @@ extern jwt_secret_len
 
 ; epoll_event is 12 bytes packed on x86_64 Linux:
 ; events: uint32_t (4 bytes)
-; data: epoll_data_t (8 bytes)
+; data: epoll_data_t (8 bytes pointer/uint64)
 struc epoll_event_s
     .events     resd 1
-    .data_fd    resd 1
-    .data_pad   resd 1
+    .data_ptr   resq 1
 endstruc
 
 section .rodata
+align 16
+sse_nl_mask:        times 16 db 0x0a
+
 env_sqlite_path:    db "SQLITE_PATH", 0
 env_jwt_secret:     db "JWT_SECRET", 0
 env_host:           db "HOST", 0
@@ -86,13 +89,13 @@ section .text
 global main
 
 ; =============================================================================
-; close_client(int fd [edi])
+; close_client(conn_state *cs [rdi])
 ; =============================================================================
 close_client:
     push rbx
     push rbp
     mov rbp, rsp
-    mov ebx, edi            ; fd
+    mov rbx, rdi            ; cs*
 
     ; Decrement active_conns
     cmp dword [active_conns], 0
@@ -100,22 +103,12 @@ close_client:
     dec dword [active_conns]
 .skip_dec:
 
-    ; Remove from epoll
-    mov edi, [epoll_fd]
-    mov esi, EPOLL_CTL_DEL
-    mov edx, ebx
-    xor ecx, ecx
-    call epoll_ctl
-
-    ; Close socket
-    mov edi, ebx
+    ; Close socket (closing fd automatically removes it from all epoll sets in Linux kernel)
+    mov edi, [rbx + conn_state.fd]
     call close
 
     ; Reset conn_state.read_len = 0
-    mov rax, [conn_table]
-    mov rdx, conn_state_size
-    imul rdx, rbx
-    mov qword [rax + rdx + conn_state.read_len], 0
+    mov qword [rbx + conn_state.read_len], 0
 
     leave
     pop rbx
@@ -219,6 +212,9 @@ main:
     call exit
 
 .db_ok:
+    ; 5b. Cache EVP_sha256() pointer for JWT verification
+    call init_jwt
+
     ; 6. Allocate Connection Table using mmap (demand-paged)
     ; size = MAX_FDS * sizeof(conn_state)
     xor edi, edi            ; addr = NULL
@@ -319,9 +315,7 @@ main:
     ; Add listen_fd to epoll
     sub rsp, 16             ; struct epoll_event (12 bytes)
     mov dword [rsp + epoll_event_s.events], EPOLLIN
-    mov eax, [listen_fd]
-    mov dword [rsp + epoll_event_s.data_fd], eax
-    mov dword [rsp + epoll_event_s.data_pad], 0
+    mov qword [rsp + epoll_event_s.data_ptr], 0 ; NULL indicates listen_fd
 
     mov edi, r12d
     mov esi, EPOLL_CTL_ADD
@@ -344,24 +338,20 @@ main:
 
     mov r13d, eax           ; number of ready events
     xor r14d, r14d          ; event index (0 .. r13d - 1)
+    lea r15, [epoll_events_buf] ; pointer to current epoll_event
 
 .process_events:
     cmp r14d, r13d
     jge .event_loop
 
-    ; events[r14] offset = r14 * 12
-    mov rax, r14
-    imul rax, 12
-    lea r15, [epoll_events_buf + rax]
-
-    mov ebx, [r15 + epoll_event_s.data_fd]
-    mov eax, [r15 + epoll_event_s.events]
-
-    ; Check if event is on listen_fd
-    cmp ebx, [listen_fd]
-    je .handle_accept
+    mov r12, [r15 + epoll_event_s.data_ptr]
+    test r12, r12
+    jz .handle_accept
 
     ; Client Socket Event
+    mov ebx, [r12 + conn_state.fd]
+    mov eax, [r15 + epoll_event_s.events]
+
     ; Check errors / hangup
     test eax, (EPOLLERR | EPOLLHUP | EPOLLRDHUP)
     jnz .client_disconnect
@@ -370,14 +360,12 @@ main:
     test eax, EPOLLIN
     jnz .handle_client_read
 
-    inc r14d
-    jmp .process_events
+    jmp .next_ready_event
 
 .client_disconnect:
-    mov edi, ebx
+    mov rdi, r12
     call close_client
-    inc r14d
-    jmp .process_events
+    jmp .next_ready_event
 
 .handle_accept:
     ; Loop accept4 until EAGAIN
@@ -394,25 +382,23 @@ main:
     cmp ebx, MAX_FDS
     jge .reject_client
 
+    ; Initialize conn_state pointer r12 = conn_table + client_fd * conn_state_size
+    mov rax, [conn_table]
+    mov rdx, conn_state_size
+    imul rdx, rbx
+    lea r12, [rax + rdx]
+    mov dword [r12 + conn_state.fd], ebx
+    mov qword [r12 + conn_state.read_len], 0
 
-    ; Add client to epoll
-    ; events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP
+    ; Add client to epoll with data_ptr = r12 (conn_state*)
     mov dword [rbp - 112 + epoll_event_s.events], (EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP)
-    mov dword [rbp - 112 + epoll_event_s.data_fd], ebx
-    mov dword [rbp - 112 + epoll_event_s.data_pad], 0
+    mov qword [rbp - 112 + epoll_event_s.data_ptr], r12
 
     mov edi, [epoll_fd]
     mov esi, EPOLL_CTL_ADD
     mov edx, ebx
     lea rcx, [rbp - 112]
     call epoll_ctl
-
-    ; Initialize conn_state
-    mov rax, [conn_table]
-    mov rdx, conn_state_size
-    imul rdx, rbx
-    mov dword [rax + rdx + conn_state.fd], ebx
-    mov qword [rax + rdx + conn_state.read_len], 0
     inc dword [active_conns]
 
     jmp .accept_loop
@@ -423,16 +409,10 @@ main:
     jmp .accept_loop
 
 .accept_done:
-    inc r14d
-    jmp .process_events
+    jmp .next_ready_event
 
 .handle_client_read:
-    ; Pointer to client conn_state
-    mov rax, [conn_table]
-    mov rdx, conn_state_size
-    imul rdx, rbx
-    lea r12, [rax + rdx]    ; r12 = conn_state*
-
+    ; r12 already points directly to client conn_state!
     mov rax, [r12 + conn_state.read_len]
     cmp rax, REQ_BUF_SIZE
     jge .client_disconnect  ; buffer full
@@ -458,25 +438,73 @@ main:
     xor ecx, ecx
     xor edx, edx            ; header_end flag
 
-.scan_header_end:
-    lea rax, [rcx + 4]
-    cmp rax, rsi
-    jg .check_lf_lf
-    ; \r\n\r\n = 0x0A0D0A0D
-    mov eax, [rdi + rcx]
-    cmp eax, 0x0a0d0a0d
-    je .found_end
-    inc rcx
-    jmp .scan_header_end
+    ; If read_len < 2, cannot contain \n\n or \r\n\r\n
+    cmp rsi, 2
+    jb .need_more_data
 
-.check_lf_lf:
-    lea rax, [rcx + 2]
+    ; Fast SSE2 scan in 16-byte blocks searching for 0x0A ('\n')
+    movdqa xmm1, [sse_nl_mask]
+
+.sse_scan_loop:
+    lea rax, [rcx + 16]
     cmp rax, rsi
-    jg .need_more_data
-    cmp word [rdi + rcx], 0x0a0a
+    jg .scan_tail
+
+    movdqu xmm0, [rdi + rcx]
+    pcmpeqb xmm0, xmm1
+    pmovmskb eax, xmm0
+    test eax, eax
+    jz .sse_scan_next
+
+.sse_nl_loop:
+    bsf r8d, eax            ; r8d = byte offset (0..15) of first newline
+    lea r9, [rcx + r8]      ; r9 = absolute index in buffer of newline
+
+    ; Check if r9 is the end of \r\n\r\n (requires r9 >= 3)
+    cmp r9, 3
+    jb .sse_check_lflf
+    cmp dword [rdi + r9 - 3], 0x0a0d0a0d
     je .found_end
+
+.sse_check_lflf:
+    ; Check if r9 is the end of \n\n (requires r9 >= 1)
+    cmp r9, 1
+    jb .sse_next_nl_bit
+    cmp word [rdi + r9 - 1], 0x0a0a
+    je .found_end
+
+.sse_next_nl_bit:
+    ; Clear lowest set bit in eax: eax &= (eax - 1)
+    lea r8d, [eax - 1]
+    and eax, r8d
+    jnz .sse_nl_loop
+
+.sse_scan_next:
+    add rcx, 16
+    jmp .sse_scan_loop
+
+.scan_tail:
+    ; Scalar scan for trailing bytes (< 16 bytes)
+    cmp rcx, rsi
+    jge .need_more_data
+    cmp byte [rdi + rcx], 0x0a
+    jne .tail_next
+
+    ; Check if rcx is end of \r\n\r\n
+    cmp rcx, 3
+    jb .tail_check_lflf
+    cmp dword [rdi + rcx - 3], 0x0a0d0a0d
+    je .found_end
+
+.tail_check_lflf:
+    cmp rcx, 1
+    jb .tail_next
+    cmp word [rdi + rcx - 1], 0x0a0a
+    je .found_end
+
+.tail_next:
     inc rcx
-    jmp .check_lf_lf
+    jmp .scan_tail
 
 .found_end:
     mov edx, 1
@@ -495,7 +523,7 @@ main:
     lea r8, [rsp + 8]       ; out_keep_alive
     call handle_http_request
 
-    mov r15, [rsp]          ; resp_len
+    mov rdx, [rsp]          ; resp_len
     mov eax, [rsp + 8]      ; keep_alive
     add rsp, 32
     push rax                ; preserve keep_alive across write
@@ -503,7 +531,7 @@ main:
     ; Write response to socket
     mov edi, ebx
     lea rsi, [resp_buffer]
-    mov rdx, r15
+    ; rdx already contains resp_len
     call write
 
     pop rax                 ; restore keep_alive
@@ -516,11 +544,12 @@ main:
     jmp .next_ready_event
 
 .close_conn:
-    mov edi, ebx
+    mov rdi, r12
     call close_client
 
 .next_ready_event:
     inc r14d
+    add r15, 12
     jmp .process_events
 
 .sock_fail:

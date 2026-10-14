@@ -33,9 +33,21 @@ b64url_decode_table:
 
 section .text
 
+global init_jwt
 global jwt_verify
 global b64url_encode_32
 global b64url_decode
+
+; =============================================================================
+; init_jwt()
+; Resolves and caches EVP_sha256() once at boot
+; =============================================================================
+init_jwt:
+    sub rsp, 8
+    call EVP_sha256
+    mov [evp_sha256_md], rax
+    add rsp, 8
+    ret
 
 ; =============================================================================
 ; b64url_encode_32(const uint8_t *in_32 [rdi], char *out_43 [rsi])
@@ -409,8 +421,7 @@ jwt_verify:
 
     ; 3. Verify Signature
     ; data to sign: token[0 .. dot2] (header + '.' + payload)
-    call EVP_sha256
-    mov rdi, rax            ; EVP_sha256()
+    mov rdi, [evp_sha256_md] ; cached EVP_sha256() pointer
     mov rsi, r14            ; secret
     mov edx, r15d           ; secret_len
     mov rcx, r12            ; token
@@ -726,3 +737,8 @@ jwt_verify:
     pop r12
     pop rbx
     ret
+
+section .bss
+global evp_sha256_md
+evp_sha256_md: resq 1
+
