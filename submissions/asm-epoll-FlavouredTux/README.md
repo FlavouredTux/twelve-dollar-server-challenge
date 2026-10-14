@@ -14,24 +14,6 @@ Author: **[@FlavouredTux](https://github.com/FlavouredTux)**
 - **Database Driver:** Direct C ABI binding to SQLite (`libsqlite3.so`)
 - **Crypto:** OpenSSL `libcrypto.so` (`EVP_sha256()`, `HMAC`) with handwritten Base64URL encoder/decoder
 - **Deployment Mode:** **Direct (`0.0.0.0:80`)** — We chose Direct mode to eliminate the 14–20% CPU overhead incurred by running Nginx on a 1 vCPU machine. The assembly server natively handles keep-alive connections and implements adaptive pressure-based socket eviction. It also seamlessly operates behind Nginx on `127.0.0.1:3000` via `HOST` / `PORT` environment variables.
-- **Binary Footprint:** ~43 KB executable, ~6.2 MB RSS memory usage under full load
-
----
-
-## Benchmark Results
-
-Tested on the $12 droplet spec (1 vCPU, 2 GB RAM):
-
-| Metric | Result |
-|---|---|
-| **Max Concurrent Users** | **325,000 users** (SLA PASS) |
-| **Throughput** | **35,380.6 req/s** (530,709 requests) |
-| **Error Rate** | **0.000000000%** (0 failed requests) |
-| **p50 Latency** | **205.03 ms** |
-| **p95 Latency** | **370.71 ms** (SLA target < 500 ms) |
-| **p99 Latency** | **758.04 ms** (SLA target < 1,000 ms) |
-| **Memory Footprint** | **~6.2 MB RSS** |
-| **Test Suite** | **42/42 tests passed (100% green)** |
 
 ---
 
@@ -56,8 +38,8 @@ Tested on the $12 droplet spec (1 vCPU, 2 GB RAM):
 
 5. **Pre-Prepared SQLite Statements:**
    - All SQL statements are prepared once at server startup (`sqlite3_prepare_v2`), eliminating query compilation overhead during requests.
-   - In full compliance with Rules 2 & 6: writes are durable before response (`PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, `PRAGMA mmap_size = 268435456`).
+   - In full compliance with Rules 2 & 6: writes are durable before response (`PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`).
 
 6. **Hardware-Efficient Crypto & String Routines:**
-   - Hand-rolled branchless Base64URL encoder that serializes 32-byte HMAC digests directly into 43-byte signatures in CPU registers.
+   - Hand-rolled Base64URL encoder that serializes 32-byte HMAC digests directly into 43-byte signatures in CPU registers.
    - Full compliance with Rule 5: fresh HMAC-SHA256 signature verification and expiration check on every authenticated request with zero cross-request caching.
