@@ -303,7 +303,7 @@ main:
 
     ; Listen
     mov edi, ebx
-    mov esi, 4096
+    mov esi, 65535
     call listen
     test eax, eax
     jnz .sock_fail
